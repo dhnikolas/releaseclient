@@ -1,6 +1,6 @@
 module releaseclient
 
-go 1.21
+go 1.19
 
 require (
 	github.com/dhnikolas/release-operator v0.0.0-20230902094727-e1f54d4677d4

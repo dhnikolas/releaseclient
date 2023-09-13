@@ -40,34 +40,39 @@ func (r *ReleaseClient) ApplyBuild(ctx context.Context, buildName string, taskLi
 	build.Namespace = "default"
 	build.Name = buildName
 
+	repos := taskToRepo(taskList)
+	build.Spec.Repos = repos
+}
+
+func taskToRepo(taskList []Task) []releasev1alpha1.Repo {
 	repos := new([]releasev1alpha1.Repo)
 	for _, task := range taskList {
 		for _, service := range task.Services {
-
+			addBranchToRepo(repos, service, task.BranchName)
 		}
 	}
 
-	build.Spec.Repos
-
+	return *repos
 }
 
 func addBranchToRepo(repos *[]releasev1alpha1.Repo, repoName, branchName string) {
-	currentRepo := getRepoByName(repos, repoName)
-	if currentRepo == nil {
+	repoIndex, ok := getRepoByName(repos, repoName)
+	if !ok {
 		*repos = append(*repos, releasev1alpha1.Repo{
 			URL:      repoName,
 			Branches: []releasev1alpha1.Branch{{Name: branchName}},
 		})
 	} else {
-		currentRepo.Branches = append(currentRepo.Branches)
+		currentRepo := *repos
+		currentRepo[repoIndex].Branches = append(currentRepo[repoIndex].Branches, releasev1alpha1.Branch{Name: branchName})
 	}
 }
 
-func getRepoByName(repos *[]releasev1alpha1.Repo, repoName string) *releasev1alpha1.Repo {
-	for _, repo := range *repos {
+func getRepoByName(repos *[]releasev1alpha1.Repo, repoName string) (int, bool) {
+	for i, repo := range *repos {
 		if repo.URL == repoName {
-			return &repo
+			return i, true
 		}
 	}
-	return nil
+	return 0, false
 }
