@@ -6,28 +6,14 @@ import (
 	releasev1alpha1 "github.com/dhnikolas/release-operator/api/v1alpha1"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	crc "sigs.k8s.io/controller-runtime/pkg/client"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type ReleaseClient struct {
 	kubeClient     client.Client
 	ignoreServices []string
-}
-
-func New(kubeConfigBase64 string, ignoreServices []string) (*ReleaseClient, error) {
-	kubeConfig, err := base64.StdEncoding.DecodeString(kubeConfigBase64)
-	if err != nil {
-		return nil, err
-	}
-	config, err := clientcmd.RESTConfigFromKubeConfig(kubeConfig)
-	c, err := client.New(config, client.Options{})
-	if err != nil {
-		return nil, err
-	}
-
-	return &ReleaseClient{
-		kubeClient:     c,
-		ignoreServices: ignoreServices,
-	}, nil
+	namespace      string
 }
 
 type Task struct {
@@ -35,44 +21,145 @@ type Task struct {
 	Services   []string
 }
 
-func (r *ReleaseClient) ApplyBuild(ctx context.Context, buildName string, taskList []Task) {
-	build := &releasev1alpha1.Build{}
-	build.Namespace = "default"
-	build.Name = buildName
+type BuildStatus struct {
+	Name  string
+	Ready bool
+	Tasks []*TaskStatus
+}
 
+type TaskStatus struct {
+	BranchName string
+	Statuses   []BranchStatus
+}
+
+type BranchStatus struct {
+	ServiceName    string
+	Valid          bool
+	Merged         bool
+	Conflict       bool
+	ConflictBranch string
+}
+
+func New(kubeConfigBase64, defaultNamespace string, ignoreServices []string) (*ReleaseClient, error) {
+	kubeConfig, err := base64.StdEncoding.DecodeString(kubeConfigBase64)
+	if err != nil {
+		return nil, err
+	}
+	config, err := clientcmd.RESTConfigFromKubeConfig(kubeConfig)
+	c, err := client.New(config, client.Options{
+		Scheme: BuildScheme(releasev1alpha1.SchemeBuilder),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &ReleaseClient{
+		kubeClient:     c,
+		ignoreServices: ignoreServices,
+		namespace:      defaultNamespace,
+	}, nil
+}
+
+func (bs *BuildStatus) GetTaskByName(name string) *TaskStatus {
+	for _, task := range bs.Tasks {
+		if task.BranchName == name {
+			return task
+		}
+	}
+	return nil
+}
+
+func (r *ReleaseClient) ApplyBuild(ctx context.Context, buildName string, taskList []Task) error {
+	build := &releasev1alpha1.Build{}
+	build.Namespace = r.namespace
+	build.Name = buildName
+	exist, err := getObject(ctx, r.kubeClient, buildName, build)
+	if err != nil {
+		return err
+	}
 	repos := taskToRepo(taskList)
 	build.Spec.Repos = repos
-}
-
-func taskToRepo(taskList []Task) []releasev1alpha1.Repo {
-	repos := new([]releasev1alpha1.Repo)
-	for _, task := range taskList {
-		for _, service := range task.Services {
-			addBranchToRepo(repos, service, task.BranchName)
+	if exist {
+		err = r.kubeClient.Update(ctx, build)
+		if err != nil {
+			return err
 		}
-	}
 
-	return *repos
-}
-
-func addBranchToRepo(repos *[]releasev1alpha1.Repo, repoName, branchName string) {
-	repoIndex, ok := getRepoByName(repos, repoName)
-	if !ok {
-		*repos = append(*repos, releasev1alpha1.Repo{
-			URL:      repoName,
-			Branches: []releasev1alpha1.Branch{{Name: branchName}},
-		})
 	} else {
-		currentRepo := *repos
-		currentRepo[repoIndex].Branches = append(currentRepo[repoIndex].Branches, releasev1alpha1.Branch{Name: branchName})
-	}
-}
-
-func getRepoByName(repos *[]releasev1alpha1.Repo, repoName string) (int, bool) {
-	for i, repo := range *repos {
-		if repo.URL == repoName {
-			return i, true
+		err := r.kubeClient.Create(ctx, build)
+		if err != nil {
+			return err
 		}
 	}
-	return 0, false
+
+	return nil
+}
+
+func (r *ReleaseClient) GetBuildInfo(ctx context.Context, buildName string) (*BuildStatus, error) {
+	build := &releasev1alpha1.Build{}
+	build.Namespace = r.namespace
+	build.Name = buildName
+	_, err := getObject(ctx, r.kubeClient, buildName, build)
+	if err != nil {
+		return nil, err
+	}
+
+	selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{
+			{
+				Key:      "build.release.salt.x5.ru/build-name",
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{buildName},
+			},
+		},
+	})
+
+	merges := &releasev1alpha1.MergeList{}
+	err = r.kubeClient.List(ctx, merges, &crc.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, err
+	}
+
+	bs := &BuildStatus{
+		Name:  buildName,
+		Tasks: make([]*TaskStatus, 0),
+	}
+	isReady := true
+	for _, item := range merges.Items {
+		for _, branch := range item.Status.Branches {
+			if branch.IsMerged != "True" {
+				isReady = false
+			}
+			taskStatus := bs.GetTaskByName(branch.Name)
+			resolveBranch := ""
+			if item.Status.ResolveConflictBranch != nil {
+				resolveBranch = item.Status.ResolveConflictBranch.Name
+			}
+			if taskStatus == nil {
+				bs.Tasks = append(bs.Tasks, &TaskStatus{
+					BranchName: branch.Name,
+					Statuses: []BranchStatus{
+						{
+							ServiceName:    item.Status.ProjectPID,
+							Valid:          branch.IsValid == "True",
+							Merged:         branch.IsMerged == "True",
+							Conflict:       item.Status.ResolveConflictBranch != nil,
+							ConflictBranch: resolveBranch,
+						},
+					},
+				})
+			} else {
+				taskStatus.Statuses = append(taskStatus.Statuses, BranchStatus{
+					ServiceName:    item.Status.ProjectPID,
+					Valid:          branch.IsValid == "True",
+					Merged:         branch.IsMerged == "True",
+					Conflict:       item.Status.ResolveConflictBranch != nil,
+					ConflictBranch: resolveBranch,
+				})
+			}
+		}
+	}
+
+	bs.Ready = isReady
+	return bs, nil
 }
